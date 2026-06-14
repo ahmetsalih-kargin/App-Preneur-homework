@@ -59,10 +59,18 @@ services:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - BACKEND_INTERNAL_URL=http://backend:8000
     depends_on:
       - backend
     volumes:
       - ./frontend:/app
       - /app/node_modules
+  zap:
+    image: zaproxy/zap-stable
+    container_name: nexus_zap
+    restart: always
+    command: zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true
+    ports:
+      - "8090:8080"
 volumes:
   postgres_data:

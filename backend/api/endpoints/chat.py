@@ -27,7 +27,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
 
-@router.post("/", response_model=ChatResponse)
+@router.post("", response_model=ChatResponse)
 async def chat_with_copilot(request: ChatRequest, db: AsyncSession = Depends(deps.get_db)):
     if not OPENROUTER_API_KEY:
         return {"reply": "AI Asistan şu anda kullanılamıyor: OPENROUTER_API_KEY eksik. Lütfen yapılandırmayı kontrol edin."}

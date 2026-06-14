@@ -30,12 +30,13 @@ def run_full_osint_scan(self, target_id: str, domain: str):
     try:
         logger.info(f"🚀 [WORKER] İstihbarat taraması başladı! Hedef: {domain}")
         
-        # 1. INIT ATOMIC COUNTER: 2 ana görev başlattığımız için sayacı 2 yapıyoruz.
-        asyncio.run(_set_active_scans(uuid.UUID(target_id), 2))
+        # 1. INIT ATOMIC COUNTER: 3 ana görev başlattığımız için sayacı 3 yapıyoruz. (Amass, Nuclei, ZAP)
+        asyncio.run(_set_active_scans(uuid.UUID(target_id), 3))
         
         # SOAR AUTOMATION FIX:
-        # Taramaya başlar başlamaz KÖK DOMAIN (Root Domain) için anında Nuclei'yi paralel olarak fırlat!
+        # Taramaya başlar başlamaz KÖK DOMAIN (Root Domain) için anında Nuclei ve ZAP'i paralel olarak fırlat!
         run_nuclei_scan.delay(target_id, f"https://{domain}")
+        run_zap_scan.delay(target_id, f"http://{domain}")
         
         # Aynı zamanda Enterprise Subdomain Enumeration (Amass) işlemini paralel başlat!
         run_amass_scan.delay(target_id, domain)
@@ -474,4 +475,131 @@ async def _async_nuclei_scan(target_id_str: str, target_url: str):
         if os.path.exists(output_file):
             os.remove(output_file)
         # Nuclei görevi bitti, sayacı 1 düşür
+        await _decrement_active_scans(target_id)
+
+import httpx
+
+@celery_app.task(bind=True, max_retries=3, name="run_zap_scan")
+def run_zap_scan(self, target_id_str: str, target_url: str):
+    """OWASP ZAP ile tam teşekküllü DAST taraması yapar."""
+    logger.info(f"🕷️ [ZAP] Starting OWASP ZAP scan for {target_url}")
+    asyncio.run(_async_zap_scan(target_id_str, target_url))
+    return {"status": "success", "url": target_url}
+
+async def _save_zap_error_to_db(target_id: uuid.UUID, error_msg: str):
+    local_engine = create_async_engine(DATABASE_URL, poolclass=NullPool, echo=False)
+    LocalSession = async_sessionmaker(bind=local_engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with LocalSession() as db:
+            entity = Entity(
+                target_id=target_id,
+                entity_type=EntityType.MALICIOUS_RECORD,
+                raw_value=f"[ERROR] ZAP Engine Failed: {error_msg}",
+                source_url="zap_dast_scan",
+                confidence=1.0,
+                is_ignored=False,
+            )
+            db.add(entity)
+            await db.commit()
+        await _push_update(target_id)
+    except Exception as db_e:
+        logger.error(f"[ZAP] Could not save error to DB: {db_e}")
+    finally:
+        await local_engine.dispose()
+
+async def _async_zap_scan(target_id_str: str, target_url: str):
+    target_id = uuid.UUID(target_id_str)
+    zap_url = "http://zap:8080"
+    
+    try:
+        # Increase timeout significantly for large DAST targets (30 mins)
+        async with httpx.AsyncClient(timeout=1800.0) as client:
+            
+            # 0. Pre-flight Check
+            try:
+                logger.info(f"🔍 [ZAP] Pre-flight Check: Pinging ZAP API on {zap_url}")
+                r = await client.get(f"{zap_url}/")
+                r.raise_for_status()
+            except Exception as e:
+                logger.error(f"❌ [ZAP] Pre-flight Check Failed: {e}")
+                await _save_zap_error_to_db(target_id, "Connection Refused. Is ZAP Container running?")
+                return
+            
+            # 1. Spider Phase
+            try:
+                logger.info(f"🕷️ [ZAP] Starting Spider on {target_url}")
+                r = await client.get(f"{zap_url}/JSON/spider/action/scan/?url={target_url}")
+                scan_id = r.json().get("scan")
+                
+                # Wait for Spider (Max 10 mins)
+                for _ in range(120): 
+                    r = await client.get(f"{zap_url}/JSON/spider/view/status/?scanId={scan_id}")
+                    if int(r.json().get("status", 0)) >= 100:
+                        break
+                    await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"❌ [ZAP] Spider Phase Failed: {e}")
+                await _save_zap_error_to_db(target_id, "Spider Phase Failed or Timed Out.")
+                return
+                
+            # 2. Active Scan Phase
+            try:
+                logger.info(f"💣 [ZAP] Starting Active Scan on {target_url}")
+                r = await client.get(f"{zap_url}/JSON/ascan/action/scan/?url={target_url}")
+                ascan_id = r.json().get("scan")
+                
+                # Wait for Active Scan (Max 30 mins)
+                for _ in range(360): 
+                    r = await client.get(f"{zap_url}/JSON/ascan/view/status/?scanId={ascan_id}")
+                    if int(r.json().get("status", 0)) >= 100:
+                        break
+                    await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"❌ [ZAP] Active Scan Phase Failed: {e}")
+                await _save_zap_error_to_db(target_id, "Active Scan Phase Failed or Timed Out.")
+                return
+                
+            # 3. Fetch Alerts Phase
+            try:
+                logger.info(f"📥 [ZAP] Fetching Alerts for {target_url}")
+                r = await client.get(f"{zap_url}/JSON/core/view/alerts/?baseurl={target_url}")
+                alerts = r.json().get("alerts", [])
+                logger.info(f"☢️ [ZAP] Found {len(alerts)} vulnerabilities for {target_url}")
+            except Exception as e:
+                logger.error(f"❌ [ZAP] Fetch Alerts Phase Failed: {e}")
+                await _save_zap_error_to_db(target_id, "Fetch Alerts Phase Failed.")
+                return
+            
+            # Map Alerts to DB
+            if alerts:
+                local_engine = create_async_engine(DATABASE_URL, poolclass=NullPool, echo=False)
+                LocalSession = async_sessionmaker(bind=local_engine, class_=AsyncSession, expire_on_commit=False)
+                
+                async with LocalSession() as db:
+                    for alert in alerts:
+                        risk = alert.get("risk", "Info")
+                        name = alert.get("name", "Unknown Alert")
+                        url = alert.get("url", target_url)
+                        raw_value = f"ZAP ALERT on {url} -> [{risk.upper()}] {name}"
+                        
+                        entity = Entity(
+                            target_id=target_id,
+                            entity_type=EntityType.MALICIOUS_RECORD,
+                            raw_value=raw_value,
+                            source_url="zap_dast_scan",
+                            confidence=0.95,
+                            is_ignored=False,
+                        )
+                        db.add(entity)
+                    await db.commit()
+                await local_engine.dispose()
+                
+                # Push to Redis to trigger frontend Real-Time update
+                await _push_update(target_id)
+                
+    except Exception as e:
+        logger.error(f"❌ [ZAP] Fatal Exception during scan: {e}")
+        await _save_zap_error_to_db(target_id, "Fatal Engine Error.")
+    finally:
+        # ZAP görevi bitti, sayacı 1 düşür
         await _decrement_active_scans(target_id)

@@ -28,7 +28,7 @@ router = APIRouter()
 
 
 # ── POST /api/targets/ ────────────────────────────────────────────────────────
-@router.post("/", response_model=schemas.TargetResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=schemas.TargetResponse, status_code=status.HTTP_201_CREATED)
 async def create_target_endpoint(
     target_in: schemas.TargetCreate,
     db: AsyncSession = Depends(deps.get_db),
@@ -92,7 +92,7 @@ async def create_target_endpoint(
 
 
 # ── GET /api/targets/ ─────────────────────────────────────────────────────────
-@router.get("/", response_model=list[schemas.TargetResponse])
+@router.get("", response_model=list[schemas.TargetResponse])
 async def read_targets_endpoint(db: AsyncSession = Depends(deps.get_db)):
     """Sistemdeki tüm kayıtlı hedefleri getirir."""
     return await crud.get_targets(db=db)
