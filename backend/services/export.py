@@ -1,5 +1,7 @@
+import asyncio
 import csv
 import io
+from xml.sax.saxutils import escape as xml_escape
 import datetime
 import uuid
 import os
@@ -15,6 +17,23 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
+def _csv_safe(value: str) -> str:
+    """
+    CSV/Formül enjeksiyonu: değerler taranan sitelerden geliyor (ZAP/Nuclei URL'leri, başlıklar).
+    '=', '+', '-', '@' ile başlayan bir hücre Excel/LibreOffice'te formül olarak çalışır
+    (örn. =HYPERLINK(...) ile veri sızdırma). Başına ' eklenerek metne zorlanır.
+    """
+    if value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def _p(value: str) -> str:
+    """ReportLab Paragraph mini-HTML ayrıştırır: kaçışsız '<' veya '&' içeren bir bulgu
+    PDF üretimini çökertiyor (500) ya da <link>/<img> etiketi enjekte edilebiliyordu."""
+    return xml_escape(value or "")
+
 
 async def generate_csv_report(target_id: uuid.UUID, db: AsyncSession) -> io.StringIO:
     """Hedefe ait tüm istihbarat düğümlerini temiz bir CSV formatına çevirir."""
@@ -34,8 +53,8 @@ async def generate_csv_report(target_id: uuid.UUID, db: AsyncSession) -> io.Stri
             writer.writerow([
                 target.target_value,
                 entity.entity_type.value,
-                entity.raw_value,
-                entity.source_url,
+                _csv_safe(entity.raw_value),
+                _csv_safe(entity.source_url),
                 f"{entity.confidence * 100:.0f}%",
                 entity.created_at.isoformat() if entity.created_at else ""
             ])
@@ -131,7 +150,7 @@ async def generate_pdf_report(target_id: uuid.UUID, db: AsyncSession) -> io.Byte
     elements.append(Paragraph("SİBER İSTİHBARAT VE TEHDİT ANALİZ RAPORU", title_style))
     
     elements.append(Spacer(1, 50))
-    elements.append(Paragraph(f"Hedef Sistem: <b>{target.target_value}</b>", subtitle_style))
+    elements.append(Paragraph(f"Hedef Sistem: <b>{_p(target.target_value)}</b>", subtitle_style))
     elements.append(Paragraph(f"Rapor Tarihi: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", subtitle_style))
     
     elements.append(PageBreak())
@@ -151,7 +170,7 @@ async def generate_pdf_report(target_id: uuid.UUID, db: AsyncSession) -> io.Byte
     
     threat_rows = [] # Kırmızı işaretlenecek kritik tehdit satırlarının endeksi
     
-    for i, entity in enumerate(target.entities):
+    for entity in target.entities:
         if entity.is_ignored:
             continue
             
@@ -161,15 +180,17 @@ async def generate_pdf_report(target_id: uuid.UUID, db: AsyncSession) -> io.Byte
         # Kesme işlemi yapmıyoruz, Paragraph objesi kelimeleri wrap (kaydırma) yapacak.
         row = [
             Paragraph(entity.entity_type.value, current_cell_style),
-            Paragraph(entity.raw_value, current_cell_style),
-            Paragraph(entity.source_url, current_cell_style),
+            Paragraph(_p(entity.raw_value), current_cell_style),
+            Paragraph(_p(entity.source_url), current_cell_style),
             Paragraph(entity.created_at.strftime("%Y-%m-%d %H:%M") if entity.created_at else "", current_cell_style)
         ]
         data.append(row)
         
         # Kritik Tehdit (VirusTotal vb.) ise PDF tablosunda arkaplanı Kan Kırmızısı yap
         if is_threat:
-            threat_rows.append(i + 1)
+            # DÜZELTME: eskiden enumerate indeksi (i + 1) kullanılıyordu; atlanan (is_ignored)
+            # kayıtlar indeksi kaydırdığı için yanlış satırlar kırmızı işaretleniyordu.
+            threat_rows.append(len(data) - 1)
             
     # Table Styling
     # Sayfa genişliği (A4: 595.27 points). Sağ/Sol Margin 30'ar. Net Genişlik = 535 points.
@@ -195,8 +216,9 @@ async def generate_pdf_report(target_id: uuid.UUID, db: AsyncSession) -> io.Byte
     
     elements.append(t)
     
-    # PDF'i derle
-    doc.build(elements)
+    # PDF'i derle — CPU-yoğun ve senkron; event loop'u bloklamaması için thread'de çalıştır.
+    # (Eskiden büyük bir rapor üretilirken API'nin tüm istekleri ve WebSocket'leri donuyordu.)
+    await asyncio.to_thread(doc.build, elements)
     buffer.seek(0)
     
     return buffer

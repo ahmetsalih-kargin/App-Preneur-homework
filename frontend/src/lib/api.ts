@@ -1,6 +1,4 @@
-// frontend/src/lib/api.ts
-
-const API_BASE_URL = "http://localhost:8000/api";
+import { API_BASE_URL, API_ORIGIN } from "./config";
 
 export interface TargetCreate {
   target_value: string;
@@ -15,13 +13,13 @@ export interface TargetResponse {
   updated_at: string;
 }
 
-// ── Graph payload types (matches backend GraphPayloadResponse) ─────────────
+// Backend GraphPayloadResponse ile birebir aynı şekil
 export interface ApiGraphNode {
   id: string;
   label: string;
   group: string;
-  parentNode?: string;
-  discovery_date?: string;
+  parentNode?: string | null;
+  discovery_date?: string | null;
 }
 
 export interface ApiGraphEdge {
@@ -35,59 +33,80 @@ export interface ApiGraphPayload {
   links: ApiGraphEdge[];
 }
 
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+/** Sunucudan gelen veriyi beklenen şekle zorlar; bozuk mesaj grafiği çökertmesin. */
+export function toGraphPayload(raw: unknown): ApiGraphPayload | null {
+  if (!raw || typeof raw !== "object") return null;
+  const { nodes, links } = raw as { nodes?: unknown; links?: unknown };
+  if (!Array.isArray(nodes) || !Array.isArray(links)) return null;
+  return {
+    nodes: nodes.filter(
+      (n): n is ApiGraphNode =>
+        !!n && typeof n.id === "string" && typeof n.label === "string" && typeof n.group === "string",
+    ),
+    links: links.filter(
+      (l): l is ApiGraphEdge => !!l && typeof l.source === "string" && typeof l.target === "string",
+    ),
+  };
+}
+
+async function readError(response: Response, fallback: string): Promise<string> {
+  const data = await response.json().catch(() => null);
+  const detail = data?.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && typeof detail[0]?.msg === "string") {
+    // Pydantic "Value error, ..." önekini kullanıcıya göstermeye gerek yok
+    return detail[0].msg.replace(/^Value error,\s*/i, "");
+  }
+  return fallback;
+}
+
+const id = (value: string) => encodeURIComponent(value);
+
 export const api = {
-  /** Veritabanına yeni hedef ekleyen fonksiyon */
   createTarget: async (data: TargetCreate): Promise<TargetResponse> => {
-    const response = await fetch(`${API_BASE_URL}/targets/`, {
+    const response = await fetch(`${API_BASE_URL}/targets`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(data),
     });
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => null);
-      let errorMessage = "Hedef eklenirken bir hata oluştu";
-      if (errorData?.detail) {
-        if (Array.isArray(errorData.detail)) {
-          errorMessage = errorData.detail[0].msg || errorMessage;
-        } else if (typeof errorData.detail === 'string') {
-          errorMessage = errorData.detail;
-        }
-      }
-      throw new Error(errorMessage);
-    }
+    if (!response.ok) throw new Error(await readError(response, "Hedef eklenemedi."));
     return response.json();
   },
 
-  /** Belirli bir hedefin OSINT graf verisini çeker */
   fetchTargetGraph: async (targetId: string): Promise<ApiGraphPayload> => {
-    // KÖK NEDEN ÇÖZÜMÜ: Next.js ve Tarayıcı önbelleğini (cache) kırarak her zaman taze veri al
-    const response = await fetch(`${API_BASE_URL}/targets/${targetId}/graph`, { cache: 'no-store' });
-    if (!response.ok) throw new Error("Graf verisi alınamadı");
-    return response.json();
+    const response = await fetch(`${API_BASE_URL}/targets/${id(targetId)}/graph`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Graf verisi alınamadı.");
+    const payload = toGraphPayload(await response.json());
+    if (!payload) throw new Error("Sunucu beklenmeyen bir graf yanıtı döndürdü.");
+    return payload;
   },
 
-  /** Fallback Polling mekanizması için hedef tarama durumunu kontrol eder */
   fetchTargetStatus: async (targetId: string): Promise<{ status: string }> => {
-    const response = await fetch(`${API_BASE_URL}/targets/${targetId}/status`, { cache: 'no-store' });
-    if (!response.ok) throw new Error("Durum alınamadı");
+    const response = await fetch(`${API_BASE_URL}/targets/${id(targetId)}/status`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Tarama durumu alınamadı.");
     return response.json();
   },
 
-  /** Özel bir düğüm için LLM destekli analiz gerekçesi getirir */
-  fetchAiRationale: async (nodeId: string): Promise<{ rationale: string }> => {
-    const response = await fetch(`${API_BASE_URL}/nodes/${nodeId}/ai-rationale`, { cache: 'no-store' });
-    if (!response.ok) throw new Error("AI Analizi alınamadı");
+  fetchAiRationale: async (nodeId: string, signal?: AbortSignal): Promise<{ rationale: string }> => {
+    const response = await fetch(`${API_BASE_URL}/nodes/${id(nodeId)}/ai-rationale`, { cache: "no-store", signal });
+    if (!response.ok) throw new Error("Yapay zekâ yorumu alınamadı.");
     return response.json();
   },
 
-  /** SOC Copilot ile sohbet eder */
-  chatWithCopilot: async (targetId: string | null, messages: {role: string, content: string}[]): Promise<{ reply: string }> => {
-    const response = await fetch(`${API_BASE_URL}/chat/`, {
+  chatWithCopilot: async (targetId: string | null, messages: ChatTurn[]): Promise<{ reply: string }> => {
+    const response = await fetch(`${API_BASE_URL}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ target_id: targetId, messages }),
     });
-    if (!response.ok) throw new Error("Chat isteği başarısız oldu");
+    if (!response.ok) throw new Error(await readError(response, "Asistana ulaşılamadı."));
     return response.json();
   },
+
+  exportUrl: (targetId: string, format: "pdf" | "csv") => `${API_ORIGIN}/api/export/${id(targetId)}/${format}`,
 };

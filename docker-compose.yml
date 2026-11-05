@@ -8,29 +8,32 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: nexusosint
+    # Yalnızca bu makineden erişilebilir (eskiden tüm ağ arayüzlerine açıktı)
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
   redis:
     image: redis:7-alpine
     container_name: nexus_redis
     restart: always
+    # Redis parolasız; Celery broker olduğu için ağa açık olması = uzaktan görev enjeksiyonu
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
   backend:
     build: 
       context: ./backend
     container_name: nexus_api
     restart: always
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - REDIS_URL=redis://redis:6379/0
       - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     depends_on:
       - db
       - redis
@@ -46,6 +49,7 @@ services:
       - VIRUSTOTAL_API_KEY=${VIRUSTOTAL_API_KEY}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - ZAP_API_KEY=${ZAP_API_KEY:?ZAP_API_KEY tanimlanmali}
     depends_on:
       - db
       - redis
@@ -56,7 +60,7 @@ services:
     container_name: nexus_ui
     restart: always
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       - NEXT_PUBLIC_API_URL=http://localhost:8000
       - BACKEND_INTERNAL_URL=http://backend:8000
@@ -69,8 +73,10 @@ services:
     image: zaproxy/zap-stable
     container_name: nexus_zap
     restart: always
-    command: zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true
-    ports:
-      - "8090:8080"
+    # GÜVENLİK: Eskiden api.disablekey=true + tüm adreslere izin + 8090 portu dışa açıktı.
+    # ZAP API dosya okuma/yazma ve betik çalıştırmaya izin verdiği için bu, ağdaki herkese
+    # konteyner içinde kod çalıştırma imkânı demekti. Artık API anahtarı zorunlu ve port
+    # dışa açılmıyor; worker iç Docker ağı üzerinden (http://zap:8080) erişiyor.
+    command: zap.sh -daemon -host 0.0.0.0 -port 8080 -config api.key=${ZAP_API_KEY:?ZAP_API_KEY tanimlanmali} -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true
 volumes:
   postgres_data:

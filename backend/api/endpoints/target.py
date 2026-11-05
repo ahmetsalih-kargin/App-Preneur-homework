@@ -26,6 +26,17 @@ import uuid
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Tek bağlantı havuzu. Eskiden her durum sorgusu ve her WebSocket için yeni bir
+# Redis istemcisi (ve havuzu) oluşturuluyordu.
+_redis: aioredis.Redis | None = None
+
+
+def _get_redis() -> aioredis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = aioredis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+    return _redis
+
 
 # ── POST /api/targets/ ────────────────────────────────────────────────────────
 @router.post("", response_model=schemas.TargetResponse, status_code=status.HTTP_201_CREATED)
@@ -228,18 +239,14 @@ async def get_target_status(target_id: uuid.UUID):
     Fallback polling endpoint for frontend.
     Returns 'COMPLETED' if active scans are 0, else 'RUNNING'.
     """
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-    redis_client = aioredis.from_url(redis_url)
     try:
-        val = await redis_client.get(f"active_scans_{target_id}")
+        val = await _get_redis().get(f"active_scans_{target_id}")
         if val is None or int(val) <= 0:
             return {"status": "COMPLETED"}
         return {"status": "RUNNING"}
     except Exception as e:
         logger.error(f"[API] Fallback status error: {e}")
         return {"status": "COMPLETED"} # fallback
-    finally:
-        await redis_client.close()
 
 
 # ── WS /api/targets/ws/{target_id} ───────────────────────────────────────────
@@ -252,51 +259,72 @@ async def websocket_target_graph(websocket: WebSocket, target_id: uuid.UUID):
     await websocket.accept()
     logger.info(f"[WS] İstemci bağlandı: {target_id}")
 
-    # 1. Bağlanılan an mevcut durumu gönder
-    async with deps.AsyncSessionLocal() as db:
+    # Önce abone ol, SONRA ilk durumu gönder: eskiden ilk grafik ile abonelik arasında
+    # yayınlanan güncellemeler (örn. hızlı biten DNS hatası) kayboluyordu.
+    pubsub = _get_redis().pubsub()
+    channel = f"graph_updates_{target_id}"
+    await pubsub.subscribe(channel)
+
+    async def send_graph() -> None:
+        async with deps.AsyncSessionLocal() as db:
+            payload = await _generate_graph_payload(target_id, db)
+        await websocket.send_json(payload.model_dump())
+
+    async def wait_for_disconnect() -> None:
+        # İstemciden mesaj beklemiyoruz; bu döngü yalnızca kopmayı fark etmek için var.
+        while True:
+            if (await websocket.receive())["type"] == "websocket.disconnect":
+                return
+
+    async def forward_updates() -> None:
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+            if message is None:
+                continue
+            data_str = message["data"].decode("utf-8")
+            if data_str == "SCAN_COMPLETED":
+                await websocket.send_json({"is_scan_completed": True, "has_error": False})
+            elif data_str == "SCAN_FAILED":
+                await send_graph()
+                await websocket.send_json({"is_scan_completed": True, "has_error": True})
+            else:
+                # Worker'lar art arda çok sayıda "update" yayınlıyor; her biri için tüm grafiği
+                # yeniden üretmek yerine kısa bir pencere içindekileri tek gönderimde birleştir.
+                await asyncio.sleep(0.3)
+                pending_terminal = None
+                while (extra := await pubsub.get_message(ignore_subscribe_messages=True, timeout=0)) is not None:
+                    extra_str = extra["data"].decode("utf-8")
+                    if extra_str in ("SCAN_COMPLETED", "SCAN_FAILED"):
+                        pending_terminal = extra_str
+                await send_graph()
+                if pending_terminal:
+                    await websocket.send_json(
+                        {"is_scan_completed": True, "has_error": pending_terminal == "SCAN_FAILED"}
+                    )
+
+    try:
         try:
-            initial_payload = await _generate_graph_payload(target_id, db)
-            await websocket.send_json(initial_payload.model_dump())
+            await send_graph()
         except HTTPException:
             await websocket.close(code=1008)
             return
 
-    # 2. Redis Pub/Sub ile Canlı Dinlemeye Başla
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-    redis_client = aioredis.from_url(redis_url)
-    pubsub = redis_client.pubsub()
-    channel = f"graph_updates_{target_id}"
-    await pubsub.subscribe(channel)
-
-    try:
-        # Worker'dan her 'update', 'SCAN_COMPLETED' veya 'SCAN_FAILED' sinyali geldiğinde taze DB oturumuyla veriyi fırlat
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                data_str = message["data"].decode("utf-8")
-                
-                if data_str == "SCAN_COMPLETED":
-                    await websocket.send_json({"is_scan_completed": True, "has_error": False})
-                    logger.info(f"[WS] Tarama Bitti Sinyali Frontend'e Pushlandı -> {target_id}")
-                
-                elif data_str == "SCAN_FAILED":
-                    # Önce hata düğümünü göndermek için güncel grafiği çekelim
-                    async with deps.AsyncSessionLocal() as db:
-                        payload = await _generate_graph_payload(target_id, db)
-                        await websocket.send_json(payload.model_dump())
-                    # Ardından başarısız bittiğini haber verelim
-                    await websocket.send_json({"is_scan_completed": True, "has_error": True})
-                    logger.info(f"[WS] Tarama Hata Sinyali Frontend'e Pushlandı -> {target_id}")
-                    
-                else:
-                    async with deps.AsyncSessionLocal() as db:
-                        payload = await _generate_graph_payload(target_id, db)
-                        await websocket.send_json(payload.model_dump())
-                        logger.info(f"[WS] Anlık veri Frontend'e Pushlandı -> {target_id}")
-
+        # DÜZELTME (bağlantı sızıntısı): eski `async for message in pubsub.listen()` döngüsü
+        # istemci koptuğunda bunu ancak bir SONRAKİ Redis mesajında fark ediyordu. Tarama bitmiş
+        # bir hedefte yeni mesaj hiç gelmediği için her kapatılan sekme bir coroutine ve bir Redis
+        # bağlantısını sonsuza dek açık bırakıyordu. Artık kopma ayrı bir görevle izleniyor.
+        tasks = {asyncio.create_task(wait_for_disconnect()), asyncio.create_task(forward_updates())}
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        # İptal edilen görev pubsub'ı kullanmayı bırakmadan unsubscribe çağırmayalım
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            if task.exception() and not isinstance(task.exception(), (WebSocketDisconnect, RuntimeError)):
+                logger.error(f"[WS] Beklenmeyen Hata: {task.exception()}")
     except WebSocketDisconnect:
-        logger.info(f"[WS] İstemci bağlantıyı kopardı: {target_id}")
-    except Exception as e:
-        logger.error(f"[WS] Beklenmeyen Hata: {e}")
+        pass
     finally:
+        logger.info(f"[WS] Bağlantı kapandı: {target_id}")
         await pubsub.unsubscribe(channel)
-        await redis_client.close()
+        await pubsub.close()

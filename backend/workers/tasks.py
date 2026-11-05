@@ -16,8 +16,12 @@ from services.scanner import (
     get_open_ports,
     check_virustotal,
 )
-import os
+from core.target_guard import all_public, is_valid_hostname, resolve_ipv4
 import redis.asyncio as aioredis
+
+# Amass her alt alan adı için ayrı bir Nuclei görevi açıyor; sınırsız fan-out,
+# tek bir hedefle worker kuyruğunu saatlerce kilitleyebiliyordu.
+MAX_NUCLEI_SUBDOMAINS = int(os.getenv("MAX_NUCLEI_SUBDOMAINS", "25"))
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +33,17 @@ def run_full_osint_scan(self, target_id: str, domain: str):
     """Kuyrukta çalışan, çökme korumalı ana tarama motoru."""
     try:
         logger.info(f"🚀 [WORKER] İstihbarat taraması başladı! Hedef: {domain}")
-        
+
+        # 0. GÜVENLİK: Aktif tarayıcıları (ZAP/Nuclei) başlatmadan ÖNCE hedefin çözümlendiğini ve
+        # yalnızca genel (public) adreslere gittiğini doğrula. Eskiden önce ZAP/Nuclei/Amass
+        # kuyruğa atılıyor, DNS kontrolü sonra yapılıyordu: geçersiz veya iç ağa çözümlenen
+        # (örn. 10.0.0.5, 127.0.0.1, 169.254.169.254) hedefler yine de saldırıya uğruyordu (SSRF).
+        ips = resolve_ipv4(domain)
+        if not ips:
+            raise ValueError(f"Target Resolution Failed: DNS records for {domain} not found.")
+        if not all_public(ips):
+            raise ValueError(f"Target Resolution Failed: {domain} resolves to a non-public address.")
+
         # 1. INIT ATOMIC COUNTER: 3 ana görev başlattığımız için sayacı 3 yapıyoruz. (Amass, Nuclei, ZAP)
         asyncio.run(_set_active_scans(uuid.UUID(target_id), 3))
         
@@ -315,37 +329,40 @@ async def _async_amass_scan(target_id_str: str, domain: str):
     try:
         # Run Amass via subprocess
         # GÜNCELLEME: -json bayrağı bazı Amass versiyonlarında kaldırıldı, yerine düz metin çıktısı (-o) kullanıyoruz
-        cmd = f"amass enum -passive -d {domain} -o {output_file}"
-        process = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        # GÜVENLİK: create_subprocess_shell yerine exec — argümanlar kabuktan geçmez,
+        # bu yüzden `;`, `|`, `$()` gibi karakterler komut olarak yorumlanamaz.
+        process = await asyncio.create_subprocess_exec(
+            "amass", "enum", "-passive", "-d", domain, "-o", output_file,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         try:
             # 5 dakikalık katı zaman aşımı (Deadlock önleme)
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
         except asyncio.TimeoutError:
             logger.warning(f"⚠️ [AMASS] Timeout expired for {domain} after 300 seconds. Proceeding with partial data.")
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
-            stdout, stderr = b"", b"Timeout"
-        
-        if process.returncode != 0:
-            logger.error(f"❌ [AMASS] Error running amass: {stderr.decode()}")
-            # Hata olsa bile oluşan dosyadan okumayı deneyebiliriz ama returncode != 0 genelde başarısızlıktır.
-            # Fakat bazen Amass hatalarla bitse bile çıktı oluşturur.
+            await process.wait()  # zombi süreç bırakma
+            stderr = b"Timeout"
 
-        # Parse text output (Each line is a subdomain)
+        if process.returncode != 0:
+            logger.error(f"❌ [AMASS] Error running amass: {stderr.decode(errors='replace')[:500]}")
+
+        # Amass v4 satırları "sub.example.com (FQDN) --> a_record --> 1.2.3.4 (IPAddress)" biçiminde
+        # olabilir. Eskiden satırın tamamı ("domain in sub" kontrolüyle) kabuk komutuna gömülüyordu;
+        # artık yalnızca ilk alan alınıyor ve katı bir hostname doğrulamasından geçiriliyor.
         discovered_subs = set()
         if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            with open(output_file, 'r') as f:
+            with open(output_file, 'r', errors='replace') as f:
                 for line in f:
-                    sub = line.strip()
-                    if not sub: continue
-                    # Amass standart çıktısında doğrudan alt alan adını satır satır basar
-                    if domain in sub:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    sub = parts[0].strip().lower().rstrip(".")
+                    if sub != domain and sub.endswith(f".{domain}") and is_valid_hostname(sub):
                         discovered_subs.add(sub)
         
         logger.info(f"✅ [AMASS] Discovered {len(discovered_subs)} subdomains for {domain}")
@@ -357,26 +374,32 @@ async def _async_amass_scan(target_id_str: str, domain: str):
         local_engine = create_async_engine(DATABASE_URL, poolclass=NullPool, echo=False)
         LocalSession = async_sessionmaker(bind=local_engine, class_=AsyncSession, expire_on_commit=False)
         
-        async with LocalSession() as db:
-            for sub in discovered_subs:
-                entity = Entity(
-                    target_id=target_id,
-                    entity_type=EntityType.SUBDOMAIN,
-                    raw_value=sub,
-                    source_url="amass_passive_scan",
-                    confidence=0.9,
-                    is_ignored=False,
-                )
-                db.add(entity)
-                
-                # SOAR AUTOMATION: Her alt alan adı için Nuclei tetikle!
-                # Önce sayacı artır, sonra görevi başlat
-                await _increment_active_scans(target_id)
-                run_nuclei_scan.delay(target_id_str, f"https://{sub}")
-                
-            await db.commit()
-            
-        await local_engine.dispose()
+        loop = asyncio.get_running_loop()
+        scan_queue: list[str] = []
+        try:
+            async with LocalSession() as db:
+                for sub in sorted(discovered_subs):
+                    db.add(Entity(
+                        target_id=target_id,
+                        entity_type=EntityType.SUBDOMAIN,
+                        raw_value=sub,
+                        source_url="amass_passive_scan",
+                        confidence=0.9,
+                        is_ignored=False,
+                    ))
+                    if len(scan_queue) < MAX_NUCLEI_SUBDOMAINS:
+                        # SSRF: alt alan adı iç ağa çözümleniyorsa aktif tarama yapma
+                        ips = await loop.run_in_executor(None, resolve_ipv4, sub)
+                        if all_public(ips):
+                            scan_queue.append(sub)
+                await db.commit()
+        finally:
+            await local_engine.dispose()
+
+        # SOAR AUTOMATION: seçilen alt alan adları için Nuclei; önce sayacı artır, sonra görevi başlat
+        for sub in scan_queue:
+            await _increment_active_scans(target_id)
+            run_nuclei_scan.delay(target_id_str, f"https://{sub}")
 
         # Push to Redis to trigger frontend Real-Time update
         await _push_update(target_id)
@@ -404,22 +427,23 @@ async def _async_nuclei_scan(target_id_str: str, target_url: str):
 
     try:
         # Run Nuclei via subprocess (Tüm bulgular gelsin, severity filtresi yok)
-        cmd = f"nuclei -u {target_url} -json-export {output_file}"
-        process = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+        # GÜVENLİK: kabuk kullanılmıyor; target_url tek bir argv öğesi olarak geçer.
+        # stdout DEVNULL: Nuclei çıktısı büyük olabilir, PIPE'ta biriktirmek belleği şişiriyordu.
+        process = await asyncio.create_subprocess_exec(
+            "nuclei", "-u", target_url, "-json-export", output_file, "-silent",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         try:
             # 5 dakikalık katı zaman aşımı (Deadlock önleme)
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            await asyncio.wait_for(process.wait(), timeout=300)
         except asyncio.TimeoutError:
             logger.warning(f"⚠️ [NUCLEI] Timeout expired for {target_url} after 300 seconds. Proceeding with partial data.")
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
-            stdout, stderr = b"", b"Timeout"
+            await process.wait()
         
         # Parse JSONL output safely (Handling both dict and list structures)
         discovered_threats = []
@@ -509,11 +533,13 @@ async def _save_zap_error_to_db(target_id: uuid.UUID, error_msg: str):
 
 async def _async_zap_scan(target_id_str: str, target_url: str):
     target_id = uuid.UUID(target_id_str)
-    zap_url = "http://zap:8080"
+    zap_url = os.getenv("ZAP_URL", "http://zap:8080")
+    # ZAP API anahtarı: docker-compose artık api.key=${ZAP_API_KEY} ile çalıştırıyor
+    zap_headers = {"X-ZAP-API-Key": os.environ["ZAP_API_KEY"]} if os.getenv("ZAP_API_KEY") else {}
     
     try:
         # Increase timeout significantly for large DAST targets (30 mins)
-        async with httpx.AsyncClient(timeout=1800.0) as client:
+        async with httpx.AsyncClient(timeout=1800.0, headers=zap_headers) as client:
             
             # 0. Pre-flight Check
             try:
@@ -528,12 +554,12 @@ async def _async_zap_scan(target_id_str: str, target_url: str):
             # 1. Spider Phase
             try:
                 logger.info(f"🕷️ [ZAP] Starting Spider on {target_url}")
-                r = await client.get(f"{zap_url}/JSON/spider/action/scan/?url={target_url}")
+                r = await client.get(f"{zap_url}/JSON/spider/action/scan/", params={"url": target_url})
                 scan_id = r.json().get("scan")
                 
                 # Wait for Spider (Max 10 mins)
                 for _ in range(120): 
-                    r = await client.get(f"{zap_url}/JSON/spider/view/status/?scanId={scan_id}")
+                    r = await client.get(f"{zap_url}/JSON/spider/view/status/", params={"scanId": scan_id})
                     if int(r.json().get("status", 0)) >= 100:
                         break
                     await asyncio.sleep(5)
@@ -545,12 +571,12 @@ async def _async_zap_scan(target_id_str: str, target_url: str):
             # 2. Active Scan Phase
             try:
                 logger.info(f"💣 [ZAP] Starting Active Scan on {target_url}")
-                r = await client.get(f"{zap_url}/JSON/ascan/action/scan/?url={target_url}")
+                r = await client.get(f"{zap_url}/JSON/ascan/action/scan/", params={"url": target_url})
                 ascan_id = r.json().get("scan")
                 
                 # Wait for Active Scan (Max 30 mins)
                 for _ in range(360): 
-                    r = await client.get(f"{zap_url}/JSON/ascan/view/status/?scanId={ascan_id}")
+                    r = await client.get(f"{zap_url}/JSON/ascan/view/status/", params={"scanId": ascan_id})
                     if int(r.json().get("status", 0)) >= 100:
                         break
                     await asyncio.sleep(5)
@@ -562,7 +588,7 @@ async def _async_zap_scan(target_id_str: str, target_url: str):
             # 3. Fetch Alerts Phase
             try:
                 logger.info(f"📥 [ZAP] Fetching Alerts for {target_url}")
-                r = await client.get(f"{zap_url}/JSON/core/view/alerts/?baseurl={target_url}")
+                r = await client.get(f"{zap_url}/JSON/core/view/alerts/", params={"baseurl": target_url})
                 alerts = r.json().get("alerts", [])
                 logger.info(f"☢️ [ZAP] Found {len(alerts)} vulnerabilities for {target_url}")
             except Exception as e:

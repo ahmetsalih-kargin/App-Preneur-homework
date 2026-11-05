@@ -2,42 +2,79 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ── Global resets ─────────────────────────────────────────────────────────── */
-html,
-body {
-  height: 100%;
-  /* Prevent mobile scroll bounce from interfering with the canvas layout */
+@layer base {
+  html,
+  body {
+    height: 100%;
+  }
+
+  /* Klavye kullanıcıları için görünür odak; fareyle tıklamada çıkmaz */
+  :focus-visible {
+    outline: 2px solid #60a5fa;
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: rgb(59 130 246 / 0.35);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* React Flow koyu tema ayarları — kütüphanenin kendi sınıfları, Tailwind ile hedeflenemiyor */
+.nexus-flow {
+  background: #09090b;
+}
+.nexus-flow .react-flow__controls {
+  box-shadow: none;
+  border: 1px solid #27272a;
+  border-radius: 6px;
   overflow: hidden;
 }
-
-/* ── Keyframe animations ───────────────────────────────────────────────────── */
-@keyframes slideInRight {
-  from {
-    opacity: 0;
-    transform: translateX(24px);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
+.nexus-flow .react-flow__controls-button {
+  width: 32px;
+  height: 32px;
+  background: #18181b;
+  border-bottom: 1px solid #27272a;
+  fill: #d4d4d8;
 }
-
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
+.nexus-flow .react-flow__controls-button:hover {
+  background: #27272a;
 }
-
-/* ── Custom scrollbar (dark theme) ────────────────────────────────────────── */
-::-webkit-scrollbar {
-  width: 4px;
+.nexus-flow .react-flow__controls-button svg {
+  fill: currentColor;
+  color: #d4d4d8;
 }
-::-webkit-scrollbar-track {
-  background: #0a0a0a;
+.nexus-flow .react-flow__minimap {
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 6px;
 }
-::-webkit-scrollbar-thumb {
-  background: #262626;
-  border-radius: 2px;
+.nexus-flow .react-flow__attribution {
+  background: transparent;
+  color: #71717a;
 }
-::-webkit-scrollbar-thumb:hover {
-  background: #3b82f6;
+.nexus-flow .react-flow__attribution a {
+  color: #a1a1aa;
+}
+/* Kütüphanenin varsayılan beyaz kutusu ve seçim çerçevesi; görünümü düğüm bileşeni çiziyor */
+.nexus-flow .react-flow__node-entity,
+.nexus-flow .react-flow__node-cluster {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none !important;
+}
+.nexus-flow .react-flow__node:focus-visible {
+  outline: 2px solid #60a5fa;
+  outline-offset: 3px;
+  border-radius: 8px;
 }
