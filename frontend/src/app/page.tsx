@@ -85,8 +85,13 @@ export default function WorkspacePage() {
       try {
         const { status } = await api.fetchTargetStatus(targetId);
         if (!cancelled && status === "COMPLETED") {
-          setScanState((prev) => (prev === "running" ? "done" : prev));
-          queryClient.invalidateQueries({ queryKey: ["graph", targetId] });
+          // Önce son grafiği çek: içinde hata düğümü varsa durum doğrudan "başarısız" olur.
+          // (Eskiden önce "tamamlandı" yazılıyor, grafik gelince "başarısız"a dönüyordu.)
+          await queryClient.invalidateQueries({ queryKey: ["graph", targetId] });
+          if (cancelled) return;
+          const latest = queryClient.getQueryData<ApiGraphPayload>(["graph", targetId]);
+          const failed = latest?.nodes.some((n) => n.label.includes("Target Resolution Failed"));
+          setScanState((prev) => (prev === "running" ? (failed ? "failed" : "done") : prev));
         }
       } catch {
         /* geçici ağ hatası: bir sonraki turda tekrar dene */

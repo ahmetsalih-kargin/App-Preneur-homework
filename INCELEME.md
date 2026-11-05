@@ -96,6 +96,8 @@ WebSocket için token'ı ilk mesajda veya `Sec-WebSocket-Protocol` başlığınd
 | O17 | İki ayrı `QueryClient` (sayfa kendi istemcisini `gcTime: 0` ile oluşturup `Providers`'ı gölgeliyordu) | eski `app/page.tsx` | **Düzeltildi** |
 | O18 | API adresi tutarsız: `api.ts` sabit `localhost:8000`, WS/dışa aktarım `NEXT_PUBLIC_API_URL` | eski `lib/api.ts` | **Düzeltildi:** `lib/config.ts` tek kaynak |
 | O19 | Düğüm yorumu her tıklamada yeni (ücretli) LLM çağrısı; panel kapanınca istek iptal edilmiyor | eski `node-context-panel.tsx` | **Düzeltildi:** React Query önbelleği + `AbortSignal` |
+| O20 | Docker imajında WebSocket kütüphanesi yoktu (`uvicorn` ekstrasız kuruluyordu); backend WS isteklerini 404 ile reddediyor, "gerçek zamanlı" güncelleme hiç çalışmıyor, yalnızca 5 sn'lik yedek yoklama işliyordu | `backend/requirements.txt` | **Düzeltildi:** `uvicorn[standard]` (Docker'da doğrulandı: bağlantı `[accepted]`) |
+| O21 | Yedek yoklama tamamlanmayı görünce önce yeşil "tamamlandı", grafik gelince "başarısız" gösteriyordu | `frontend/src/app/page.tsx` | **Düzeltildi:** durum, son grafik çekildikten sonra belirleniyor |
 
 ---
 
@@ -148,8 +150,10 @@ Teknoloji yığını aynı: Next.js 14 (App Router), React 18, Tailwind 3, React
 - Frontend: `tsc --noEmit` hatasız, `next build` başarılı. Sahte bir API ile tarayıcıda: tarama başlatma, grafik sığdırma, detay paneli, yapay zekâ yorumu yüklenmesi, saldırı yolu modu, asistan, doğrulama hata mesajı, mobil (375 px) çekmece ve grafik, klavyeyle düğüm açma ve Escape ile kapatma.
 - Backend (geçici sanal ortamda, gerçek DB/Redis olmadan): tüm modüller içe aktarılıyor; CORS (yabancı köken reddediliyor), iç IP/`localhost` hedef reddi, sohbette `system` rolü ve >20 mesaj reddi, WebSocket kopunca aboneliğin kapanması (sahte pubsub ile), zararlı içerikle PDF üretimi ve CSV önekleme.
 
+- Tam yığın `docker compose` ile (6 konteyner): Alembic göçleri tabloları ve enum'ları oluşturdu; `169.254.169.254` API'de reddedildi; ZAP 2.17 anahtarlı isteğe yanıt verip anahtarsızı reddetti; çözümlenemeyen bir alan adıyla uçtan uca akış (API → Celery → şifreli DB kaydı → WebSocket/yoklama → arayüzde "Tarama tamamlanamadı") ve hiçbir tarayıcının başlatılmadığı doğrulandı.
+
 **Doğrulanmadı (ek bağlam/ortam gerekir):**
-- Tüm yığının `docker compose` ile çalıştırılması; gerçek Postgres/Redis/Celery akışı, Alembic göçleri (artık `ENCRYPTION_KEY` olmadan çalışmaz).
-- Gerçek ZAP imajının `api.key` + `X-ZAP-API-Key` başlığıyla çalışması, Amass v4 çıktı biçimi varsayımı, Nuclei `-silent` bayrağı — bu araçlar çalıştırılmadı (üçüncü taraf hedeflere tarama yapmamak için).
+- Gerçek bir hedefe karşı Amass/Nuclei/ZAP taramaları (Amass v4 çıktı biçimi varsayımı, Nuclei `-silent` bayrağı, ZAP spider/aktif tarama akışı) — üçüncü taraf sistemleri izinsiz taramamak için çalıştırılmadı.
+- OpenRouter ve VirusTotal entegrasyonları (anahtar tanımlı değil).
 - `prodocs/` (frontend'in eski bir kopyası), `qa_test.py`, `test_api.*`, `TECH-STACK.md`/`PROGRESS.md` incelenmedi; `tasks_ingestion.py` yalnızca yüzeysel okundu.
 - Bağımlılıkların bilinen CVE taraması (`npm audit`, `pip-audit`) çalıştırılmadı.
